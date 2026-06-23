@@ -75,9 +75,9 @@ export class PluginManager {
      * @param {string} channel - Channel name
      * @param {string} pluginName - Name of the plugin to attach
      */
-    attachPluginToRoom(channel, pluginName) {
+    attachPluginToRoom(channel, pluginName, title) {
         const plugin = this.plugins.get(pluginName);
-        
+
         if (!plugin) {
             throw new Error(`Plugin not found: ${pluginName}`);
         }
@@ -103,6 +103,7 @@ export class PluginManager {
             plugin.module.onAttach({
                 client: this.client,
                 channel,
+                title: title || null,
                 context: instance.context
             });
         }

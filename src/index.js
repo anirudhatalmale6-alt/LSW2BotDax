@@ -58,25 +58,7 @@ export class FListBot {
 
         this.client.on('joinedChannel', ({ channel, title }) => {
             console.log(`[BOT] Joined channel: ${title || channel}`);
-            this.attachPluginsToRoom(channel);
-
-            // Auto-attach all loaded plugins to dynamically created rooms
-            // (rooms not in config.json, e.g. private fight rooms)
-            if (this.config && this.config.rooms) {
-                const isConfiguredRoom = this.config.rooms.some(
-                    r => r.channel.toLowerCase() === channel.toLowerCase()
-                );
-                if (!isConfiguredRoom) {
-                    console.log(`[BOT] Dynamic room detected: ${title || channel}, attaching all plugins`);
-                    for (const pluginName of this.pluginManager.getLoadedPlugins()) {
-                        try {
-                            this.pluginManager.attachPluginToRoom(channel, pluginName);
-                        } catch (error) {
-                            console.error(`[BOT] Failed to attach plugin ${pluginName} to dynamic room ${channel}: ${error.message}`);
-                        }
-                    }
-                }
-            }
+            this.attachPluginsToRoom(channel, title);
         });
 
         this.client.on('leftChannel', ({ channel }) => {
@@ -136,18 +118,29 @@ export class FListBot {
     /**
      * Attach plugins to a room based on configuration
      */
-    attachPluginsToRoom(channel) {
+    attachPluginsToRoom(channel, title) {
         if (!this.config || !this.config.rooms) return;
 
         // Case-insensitive comparison (F-list returns uppercase channel IDs)
         const roomConfig = this.config.rooms.find(r => r.channel.toLowerCase() === channel.toLowerCase());
-        if (!roomConfig || !roomConfig.plugins) return;
 
-        for (const pluginName of roomConfig.plugins) {
-            try {
-                this.pluginManager.attachPluginToRoom(channel, pluginName);
-            } catch (error) {
-                console.error(`[BOT] Failed to attach plugin ${pluginName} to ${channel}: ${error.message}`);
+        if (roomConfig && roomConfig.plugins) {
+            for (const pluginName of roomConfig.plugins) {
+                try {
+                    this.pluginManager.attachPluginToRoom(channel, pluginName, title);
+                } catch (error) {
+                    console.error(`[BOT] Failed to attach plugin ${pluginName} to ${channel}: ${error.message}`);
+                }
+            }
+        } else {
+            // Dynamic room (not in config) - attach all loaded plugins
+            console.log(`[BOT] Dynamic room detected: ${title || channel}, attaching all plugins`);
+            for (const pluginName of this.pluginManager.getLoadedPlugins()) {
+                try {
+                    this.pluginManager.attachPluginToRoom(channel, pluginName, title);
+                } catch (error) {
+                    console.error(`[BOT] Failed to attach plugin ${pluginName} to dynamic room ${channel}: ${error.message}`);
+                }
             }
         }
     }

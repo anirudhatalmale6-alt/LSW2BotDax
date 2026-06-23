@@ -460,70 +460,41 @@ function applyPhaseOutcome(gs, attackerWon, criticalFailure = false) {
 /**
  * Called when the plugin is attached to a room
  */
-export function onAttach({ client, channel, context }) {
-    console.log(`[${name}] Attached to ${channel}`);
+export function onAttach({ client, channel, title, context }) {
+    console.log(`[${name}] Attached to ${channel} (title: ${title || 'none'})`);
 
     // Initialize game state for this room
     context.gameState = null;
     context.challengeState = null;
-    context.pendingRolls = {}; // Track who has rolled
+    context.pendingRolls = {};
     context.isDynamicRoom = false;
 
-    // Check if there's a pending private game for this room
-    // The channel ID from F-List may differ from the room name, so also check by title
-    for (const [roomKey, pendingData] of pendingPrivateGames.entries()) {
-        if (channel.toLowerCase() === roomKey || channel.toLowerCase().includes(roomKey)) {
-            console.log(`[${name}] Found pending private game for room ${channel}`);
-            context.gameState = pendingData.gameState;
-            context.pendingRolls = {};
-            context.isDynamicRoom = true;
-            pendingPrivateGames.delete(roomKey);
-
-            // Announce the fight start in the private room
-            const p1 = pendingData.player1Name;
-            const p2 = pendingData.player2Name;
-            client.sendChannelMessage(channel, `[b]⚔️ PRIVATE FIGHT ROOM ⚔️[/b]
-[icon]${p1}[/icon] vs [icon]${p2}[/icon]
-
-[b]INITIATIVE ROLL[/b]
-Both fighters, use [b]!roll[/b] to determine who attacks first!`);
-            break;
-        }
-    }
-
-    // Also listen for JCH events to match pending games by title
-    const onJoinedChannel = ({ channel: joinedChannel, title }) => {
-        if (!title) return;
+    // Check if there's a pending private game matching this room's title
+    if (title) {
         const titleKey = title.toLowerCase();
         for (const [roomKey, pendingData] of pendingPrivateGames.entries()) {
-            if (titleKey === roomKey || titleKey.includes(roomKey)) {
-                console.log(`[${name}] Matched pending game by title for ${joinedChannel}`);
+            if (titleKey === roomKey) {
+                console.log(`[${name}] Found pending private game for room ${channel} (${title})`);
                 context.gameState = pendingData.gameState;
                 context.pendingRolls = {};
                 context.isDynamicRoom = true;
                 pendingPrivateGames.delete(roomKey);
 
+                // Send invites using the actual channel ID
+                client.send('CIU', { channel, character: pendingData.player1Name });
+                client.send('CIU', { channel, character: pendingData.player2Name });
+
+                // Announce the fight in the private room
                 const p1 = pendingData.player1Name;
                 const p2 = pendingData.player2Name;
-                client.sendChannelMessage(joinedChannel, `[b]⚔️ PRIVATE FIGHT ROOM ⚔️[/b]
+                client.sendChannelMessage(channel, `[b]⚔️ PRIVATE FIGHT ROOM ⚔️[/b]
 [icon]${p1}[/icon] vs [icon]${p2}[/icon]
 
 [b]INITIATIVE ROLL[/b]
 Both fighters, use [b]!roll[/b] to determine who attacks first!`);
-
-                client.removeListener('joinedChannel', onJoinedChannel);
                 break;
             }
         }
-    };
-
-    // Only set up the listener if there are pending games
-    if (pendingPrivateGames.size > 0) {
-        client.on('joinedChannel', onJoinedChannel);
-        // Clean up listener after 30 seconds
-        setTimeout(() => {
-            client.removeListener('joinedChannel', onJoinedChannel);
-        }, 30000);
     }
 
     // Connect to database
@@ -803,11 +774,8 @@ ${target.displayName}, use [b]!accept[/b] to accept or [b]!decline[/b] to declin
             });
 
             // Create the private room (bot auto-joins on creation)
+            // Invites are sent in onAttach once we have the actual channel ID
             client.send('CCR', { channel: roomName });
-
-            // Invite both players to the private room
-            client.send('CIU', { channel: roomName, character: p1.displayName });
-            client.send('CIU', { channel: roomName, character: p2.displayName });
 
             reply(`[b]⚔️ FIGHT ACCEPTED! ⚔️[/b]
 [icon]${p1.displayName}[/icon] vs [icon]${p2.displayName}[/icon]

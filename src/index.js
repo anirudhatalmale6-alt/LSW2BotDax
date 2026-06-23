@@ -59,6 +59,24 @@ export class FListBot {
         this.client.on('joinedChannel', ({ channel, title }) => {
             console.log(`[BOT] Joined channel: ${title || channel}`);
             this.attachPluginsToRoom(channel);
+
+            // Auto-attach all loaded plugins to dynamically created rooms
+            // (rooms not in config.json, e.g. private fight rooms)
+            if (this.config && this.config.rooms) {
+                const isConfiguredRoom = this.config.rooms.some(
+                    r => r.channel.toLowerCase() === channel.toLowerCase()
+                );
+                if (!isConfiguredRoom) {
+                    console.log(`[BOT] Dynamic room detected: ${title || channel}, attaching all plugins`);
+                    for (const pluginName of this.pluginManager.getLoadedPlugins()) {
+                        try {
+                            this.pluginManager.attachPluginToRoom(channel, pluginName);
+                        } catch (error) {
+                            console.error(`[BOT] Failed to attach plugin ${pluginName} to dynamic room ${channel}: ${error.message}`);
+                        }
+                    }
+                }
+            }
         });
 
         this.client.on('leftChannel', ({ channel }) => {

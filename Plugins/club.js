@@ -19,6 +19,9 @@ const COLLECTION_NAME = 'club_players';
 let mongoClient = null;
 let db = null;
 
+// Pending private games keyed by expected room name (for private room creation flow)
+const pendingPrivateGames = new Map();
+
 // Phase definitions
 const PHASES = {
     1: { name: 'Struggle/Grapple/Pin', winAdvance: 2, loseRegress: 1, loseSwapAttacker: true },
@@ -322,8 +325,11 @@ function determineRollWinner(attackerRoll, defenderRoll, attackerMod, defenderMo
     }
     
     // Check for crits (total 20+)
-    const attackerCrit = attackerTotal >= 20;
-    const defenderCrit = defenderTotal >= 20;
+    // A player cannot crit if their modifier is negative (even a nat 20 + negative mod < 20)
+    const attackerCanCrit = attackerMod >= 0;
+    const defenderCanCrit = defenderMod >= 0;
+    const attackerCrit = attackerCanCrit && attackerTotal >= 20;
+    const defenderCrit = defenderCanCrit && defenderTotal >= 20;
     
     if (attackerCrit && defenderCrit) {
         return { result: 'draw', attackerTotal, defenderTotal, bothCrit: true };
@@ -347,27 +353,32 @@ function determineRollWinner(attackerRoll, defenderRoll, attackerMod, defenderMo
 
 /**
  * Apply phase outcome
+ * @param {object} gs - game state
+ * @param {boolean} attackerWon - whether the attacker won the roll
+ * @param {boolean} criticalFailure - if true, the loser rolled a nat 1 (extra phase skip)
  */
-function applyPhaseOutcome(gs, attackerWon) {
+function applyPhaseOutcome(gs, attackerWon, criticalFailure = false) {
     const phaseInfo = PHASES[gs.phase];
     const attacker = gs.currentAttacker === 1 ? gs.player1 : gs.player2;
     const defender = gs.currentAttacker === 1 ? gs.player2 : gs.player1;
-    
+
     let message = '';
-    
+
     if (attackerWon) {
         // Apply debuff if this phase gives one on win
         if (phaseInfo.winDefenderDebuff) {
             defender.battleDebuff = (defender.battleDebuff || 0) + phaseInfo.winDefenderDebuff;
             message += `\n[color=red]${defender.displayName} gains ${phaseInfo.winDefenderDebuff} to all defense rolls![/color]`;
         }
-        
-        // Strip defender if Phase 2 is won
-        if (gs.phase === 2) {
+
+        // Strip defender if Phase 2 is won AND defender is still clothed
+        if (gs.phase === 2 && defender.clothed) {
             defender.clothed = false;
             message += `\n[color=yellow]${defender.displayName} has been stripped![/color]`;
+        } else if (gs.phase === 2 && !defender.clothed) {
+            message += `\n[color=yellow]${defender.displayName} is already naked - pinned down![/color]`;
         }
-        
+
         // Advance phase
         if (phaseInfo.winAdvance === null) {
             // Victory!
@@ -377,43 +388,72 @@ function applyPhaseOutcome(gs, attackerWon) {
             message += `\n\n[b]🏆 ${attacker.displayName} WINS THE FIGHT! 🏆[/b]`;
         } else {
             let nextPhase = phaseInfo.winAdvance;
-            
-            // Skip Phase 2 if defender is already naked
-            if (nextPhase === 2 && !defender.clothed) {
-                nextPhase = 3;
-                message += `\n[color=cyan]${defender.displayName} is already naked - skipping Strip phase![/color]`;
-            }
-            
+
+            // Phase 2 is NOT skipped - it converts to a Pin phase when defender is naked
+
             gs.phase = nextPhase;
             message += `\n[color=green]Advancing to Phase ${gs.phase}: ${PHASES[gs.phase].name}[/color]`;
+
+            // Critical failure (nat 1): advance one MORE phase
+            if (criticalFailure && !gs.finished) {
+                message += `\n[color=red]Nat 1 penalty! Skipping an extra phase![/color]`;
+                const extraPhaseInfo = PHASES[gs.phase];
+                if (extraPhaseInfo.winAdvance === null) {
+                    // Landing on climax phase via extra skip = victory
+                    gs.finished = true;
+                    gs.winner = attacker;
+                    gs.loser = defender;
+                    message += `\n\n[b]🏆 ${attacker.displayName} WINS THE FIGHT! 🏆[/b]`;
+                } else {
+                    // If skipping through Phase 2, strip defender if clothed
+                    if (gs.phase === 2 && defender.clothed) {
+                        defender.clothed = false;
+                        message += `\n[color=yellow]${defender.displayName} has been stripped![/color]`;
+                    }
+                    // Apply debuff if the skipped phase has one
+                    if (extraPhaseInfo.winDefenderDebuff) {
+                        defender.battleDebuff = (defender.battleDebuff || 0) + extraPhaseInfo.winDefenderDebuff;
+                        message += `\n[color=red]${defender.displayName} gains ${extraPhaseInfo.winDefenderDebuff} to all defense rolls![/color]`;
+                    }
+                    gs.phase = extraPhaseInfo.winAdvance;
+                    message += `\n[color=green]Now at Phase ${gs.phase}: ${PHASES[gs.phase].name}[/color]`;
+                }
+            }
         }
     } else {
+        // Defender won the roll
+
         // Apply debuff if this phase gives one on loss
         if (phaseInfo.loseDefenderDebuff) {
             defender.battleDebuff = (defender.battleDebuff || 0) + phaseInfo.loseDefenderDebuff;
             message += `\n[color=red]${defender.displayName} gains ${phaseInfo.loseDefenderDebuff} to future rolls for failing in Phase 3![/color]`;
         }
-        
-        // Regress phase
+
+        // Regress phase - Phase 2 is NOT skipped, it converts to Pin
         let regressPhase = phaseInfo.loseRegress;
-        
-        // Skip Phase 2 if defender is already naked
-        if (regressPhase === 2 && !defender.clothed) {
-            regressPhase = 1;
-            message += `\n[color=cyan]${defender.displayName} is already naked - skipping Strip phase![/color]`;
-        }
-        
+
         gs.phase = regressPhase;
         message += `\n[color=orange]Regressing to Phase ${gs.phase}: ${PHASES[gs.phase].name}[/color]`;
-        
-        // Swap attacker if phase 1
+
+        // Critical failure (nat 1): regress one MORE phase
+        if (criticalFailure && !gs.finished) {
+            message += `\n[color=red]Nat 1 penalty! Regressing an extra phase![/color]`;
+            const extraPhaseInfo = PHASES[gs.phase];
+            let extraRegress = extraPhaseInfo.loseRegress;
+            // Don't go below phase 1
+            if (extraRegress < 1) extraRegress = 1;
+            gs.phase = extraRegress;
+            message += `\n[color=orange]Now at Phase ${gs.phase}: ${PHASES[gs.phase].name}[/color]`;
+        }
+
+        // Swap attacker if the original phase requires it (swap only once regardless of crit)
         if (phaseInfo.loseSwapAttacker) {
             gs.currentAttacker = gs.currentAttacker === 1 ? 2 : 1;
             const newAttacker = gs.currentAttacker === 1 ? gs.player1 : gs.player2;
             message += `\n[b]${newAttacker.displayName} is now the attacker![/b]`;
         }
     }
-    
+
     return message;
 }
 
@@ -422,12 +462,70 @@ function applyPhaseOutcome(gs, attackerWon) {
  */
 export function onAttach({ client, channel, context }) {
     console.log(`[${name}] Attached to ${channel}`);
-    
+
     // Initialize game state for this room
     context.gameState = null;
     context.challengeState = null;
     context.pendingRolls = {}; // Track who has rolled
-    
+    context.isDynamicRoom = false;
+
+    // Check if there's a pending private game for this room
+    // The channel ID from F-List may differ from the room name, so also check by title
+    for (const [roomKey, pendingData] of pendingPrivateGames.entries()) {
+        if (channel.toLowerCase() === roomKey || channel.toLowerCase().includes(roomKey)) {
+            console.log(`[${name}] Found pending private game for room ${channel}`);
+            context.gameState = pendingData.gameState;
+            context.pendingRolls = {};
+            context.isDynamicRoom = true;
+            pendingPrivateGames.delete(roomKey);
+
+            // Announce the fight start in the private room
+            const p1 = pendingData.player1Name;
+            const p2 = pendingData.player2Name;
+            client.sendChannelMessage(channel, `[b]⚔️ PRIVATE FIGHT ROOM ⚔️[/b]
+[icon]${p1}[/icon] vs [icon]${p2}[/icon]
+
+[b]INITIATIVE ROLL[/b]
+Both fighters, use [b]!roll[/b] to determine who attacks first!`);
+            break;
+        }
+    }
+
+    // Also listen for JCH events to match pending games by title
+    const onJoinedChannel = ({ channel: joinedChannel, title }) => {
+        if (!title) return;
+        const titleKey = title.toLowerCase();
+        for (const [roomKey, pendingData] of pendingPrivateGames.entries()) {
+            if (titleKey === roomKey || titleKey.includes(roomKey)) {
+                console.log(`[${name}] Matched pending game by title for ${joinedChannel}`);
+                context.gameState = pendingData.gameState;
+                context.pendingRolls = {};
+                context.isDynamicRoom = true;
+                pendingPrivateGames.delete(roomKey);
+
+                const p1 = pendingData.player1Name;
+                const p2 = pendingData.player2Name;
+                client.sendChannelMessage(joinedChannel, `[b]⚔️ PRIVATE FIGHT ROOM ⚔️[/b]
+[icon]${p1}[/icon] vs [icon]${p2}[/icon]
+
+[b]INITIATIVE ROLL[/b]
+Both fighters, use [b]!roll[/b] to determine who attacks first!`);
+
+                client.removeListener('joinedChannel', onJoinedChannel);
+                break;
+            }
+        }
+    };
+
+    // Only set up the listener if there are pending games
+    if (pendingPrivateGames.size > 0) {
+        client.on('joinedChannel', onJoinedChannel);
+        // Clean up listener after 30 seconds
+        setTimeout(() => {
+            client.removeListener('joinedChannel', onJoinedChannel);
+        }, 30000);
+    }
+
     // Connect to database
     connectDB().catch(err => {
         console.error(`[${name}] Failed to connect to MongoDB:`, err);
@@ -439,6 +537,19 @@ export function onAttach({ client, channel, context }) {
  */
 export function onDetach({ client, channel, context }) {
     console.log(`[${name}] Detached from ${channel}`);
+}
+
+/**
+ * Leave a dynamic (private) room after a fight ends
+ */
+function leaveDynamicRoomIfNeeded(client, channel, context) {
+    if (context.isDynamicRoom) {
+        // Leave the private room after a short delay so final messages are seen
+        setTimeout(() => {
+            client.leaveChannel(channel);
+            console.log(`[${name}] Left dynamic room ${channel} after fight ended`);
+        }, 5000);
+    }
 }
 
 /**
@@ -639,23 +750,23 @@ ${target.displayName}, use [b]!accept[/b] to accept or [b]!decline[/b] to declin
     /**
      * !accept - Accept a challenge
      */
-    accept: async ({ character, context, reply }) => {
+    accept: async ({ character, context, client, reply }) => {
         try {
             if (!context.challengeState) {
                 reply('There is no pending challenge.');
                 return;
             }
-            
+
             if (context.challengeState.target.displayName.toLowerCase() !== character.toLowerCase()) {
                 reply(`${character}, you were not challenged!`);
                 return;
             }
-            
+
             // Start initiative phase
             const p1 = context.challengeState.challenger;
             const p2 = context.challengeState.target;
-            
-            context.gameState = {
+
+            const gameState = {
                 player1: {
                     ...p1,
                     sizeModifier: getSizeModifier(p1.height, p2.height),
@@ -678,15 +789,31 @@ ${target.displayName}, use [b]!accept[/b] to accept or [b]!decline[/b] to declin
                 currentAttacker: null,
                 initiativeState: 'rolling'
             };
-            
+
             context.challengeState = null;
-            context.pendingRolls = {};
-            
+
+            // Create a private room for the fight
+            const roomName = `Fight: ${p1.displayName} vs ${p2.displayName}`;
+
+            // Store pending game data keyed by room name for pickup in onAttach
+            pendingPrivateGames.set(roomName.toLowerCase(), {
+                gameState,
+                player1Name: p1.displayName,
+                player2Name: p2.displayName
+            });
+
+            // Create the private room (bot auto-joins on creation)
+            client.send('CCR', { channel: roomName });
+
+            // Invite both players to the private room
+            client.send('CIU', { channel: roomName, character: p1.displayName });
+            client.send('CIU', { channel: roomName, character: p2.displayName });
+
             reply(`[b]⚔️ FIGHT ACCEPTED! ⚔️[/b]
 [icon]${p1.displayName}[/icon] vs [icon]${p2.displayName}[/icon]
 
-[b]INITIATIVE ROLL[/b]
-Both fighters, use [b]!roll[/b] to determine who attacks first!`);
+A private room "[b]${roomName}[/b]" is being created. Both fighters will be invited.
+Head to the private room to begin the fight!`);
         } catch (error) {
             console.error(`[${name}] Accept error:`, error);
             reply('An error occurred. Please try again later.');
@@ -716,7 +843,7 @@ Both fighters, use [b]!roll[/b] to determine who attacks first!`);
     /**
      * !roll - Roll d20 during combat
      */
-    roll: async ({ character, context, reply }) => {
+    roll: async ({ character, context, client, channel, reply }) => {
         try {
             if (!context.gameState) {
                 reply('No fight is in progress! Use !challenge to start one.');
@@ -833,9 +960,9 @@ ${formatGameStatus(gs)}`;
                         ? `[color=green][b]${attacker.displayName} wins the roll![/b][/color]`
                         : `[color=orange][b]${defender.displayName} wins the roll![/b][/color]`;
                     
-                    // Apply phase outcome
-                    rollMsg += applyPhaseOutcome(gs, attackerWon);
-                    
+                    // Apply phase outcome (pass criticalFailure for nat 1 extra skip)
+                    rollMsg += applyPhaseOutcome(gs, attackerWon, outcome.criticalFailure || false);
+
                     gs.waitingForDefender = false;
                     gs.attackerRoll = null;
                     
@@ -843,9 +970,10 @@ ${formatGameStatus(gs)}`;
                     if (gs.finished) {
                         // Update player records
                         await recordMatchResult(gs.winner.displayName, gs.loser.displayName);
-                        
+
                         context.gameState = null;
                         reply(rollMsg);
+                        leaveDynamicRoomIfNeeded(client, channel, context);
                         return;
                     }
                 }
@@ -948,7 +1076,7 @@ ${defender.displayName}, use [b]!defendstun[/b] to defend!`);
     /**
      * !defendstun - Defend against a stun (for tie resolution)
      */
-    defendstun: async ({ character, context, reply }) => {
+    defendstun: async ({ character, context, client, channel, reply }) => {
         try {
             if (!context.gameState || !context.gameState.stunAttempt || !context.gameState.waitingForDefender) {
                 reply('No stun to defend against!');
@@ -1012,12 +1140,17 @@ ${defender.displayName}, use [b]!defendstun[/b] to defend!`);
             gs.waitingForDefender = false;
             gs.attackerRoll = null;
             
-            if (!gs.finished) {
-                rollMsg += `\n\n${formatGameStatus(gs)}`;
+            if (gs.finished) {
+                context.gameState = null;
+                reply(rollMsg);
+                leaveDynamicRoomIfNeeded(client, channel, context);
+                return;
             }
-            
+
+            rollMsg += `\n\n${formatGameStatus(gs)}`;
+
             reply(rollMsg);
-            
+
         } catch (error) {
             console.error(`[${name}] DefendStun error:`, error);
             reply('An error occurred. Please try again.');
@@ -1061,46 +1194,48 @@ ${defender.displayName}, use [b]!defendstun[/b] to defend!`);
     /**
      * !giveup - Forfeit the fight
      */
-    forfeit: async ({ character, context, reply }) => {
+    forfeit: async ({ character, context, client, channel, reply }) => {
         if (!context.gameState) {
             reply('No fight is currently in progress!');
             return;
         }
-        
+
         const gs = context.gameState;
         const isPlayer1 = gs.player1.displayName.toLowerCase() === character.toLowerCase();
         const isPlayer2 = gs.player2.displayName.toLowerCase() === character.toLowerCase();
-        
+
         if (!isPlayer1 && !isPlayer2) {
             reply(`${character}, you're not in this fight!`);
             return;
         }
-        
+
         const loser = isPlayer1 ? gs.player1 : gs.player2;
         const winner = isPlayer1 ? gs.player2 : gs.player1;
-        
+
         // Update records
         await recordMatchResult(winner.displayName, loser.displayName);
-        
+
         reply(`[b]${loser.displayName}[/b] has forfeited!
 [b]🏆 ${winner.displayName} WINS BY FORFEIT! 🏆[/b]`);
-        
+
         context.gameState = null;
+        leaveDynamicRoomIfNeeded(client, channel, context);
     },
 
     /**
      * !endfight - End the current fight (admin/reset)
      */
-    endfight: async ({ context, reply }) => {
+    endfight: async ({ context, client, channel, reply }) => {
         if (!context.gameState && !context.challengeState) {
             reply('No fight or challenge to reset.');
             return;
         }
-        
+
         context.gameState = null;
         context.challengeState = null;
         context.pendingRolls = {};
         reply('Fight has been ended and the arena has been reset.');
+        leaveDynamicRoomIfNeeded(client, channel, context);
     },
 
     /**
@@ -1117,18 +1252,20 @@ ${defender.displayName}, use [b]!defendstun[/b] to defend!`);
 
 [b]Fighting:[/b]
 [b]!challenge <player>[/b] - Challenge someone
-[b]!accept / !decline[/b] - Respond to challenge
+[b]!accept / !decline[/b] - Respond to challenge (creates a private room)
 [b]!roll[/b] - Roll d20 (initiative or combat)
 [b]!stun[/b] - Attempt high-risk stun move
 [b]!status[/b] - View current fight status
 [b]!forfeit[/b] - Give up the fight
 [b]!endfight[/b] - Reset the arena
 
-[b]Phases:[/b] Struggle → Strip → Penetration → Fuck 1 → Fuck 2 → Climax
+[b]Phases:[/b] Struggle → Strip/Pin → Penetration → Fuck 1 → Fuck 2 → Climax
 
 [b]Rules:[/b]
 • Highest roll wins (ties go to defender)
-• Roll 1 = auto-lose, Roll 20+ total = crit
+• Roll 1 = auto-lose + skip an extra phase
+• Roll 20+ total = crit (impossible if debuffs make 20 unreachable)
+• Accepted challenges create a private fight room
 • Size & streak modifiers apply automatically`);
     },
 
@@ -1143,11 +1280,13 @@ ${defender.displayName}, use [b]!defendstun[/b] to defend!`);
 • Both roll 1: Wash (no effect, reroll)
 • Both roll nat 20: Defender wins
 • Critical (20+ total): Auto-wins unless opponent also crits
+• Nat 1: Auto-lose AND skip an extra phase (double punishment)
+• Can't crit if debuffs make it impossible to reach 20
 
 [b]Phases:[/b]
 1. Struggle/Grapple - Win: Phase 2, Lose: Swap attacker
-2. Strip/Fully Pin - Win: Phase 3, Lose: Phase 1
-3. Penetration - Win: Phase 4, Lose: Phase 2 (+debuff)
+2. Strip/Pin - Win: Phase 3, Lose: Phase 1 (Pin only if already naked)
+3. Penetration - Win: Phase 4 (+debuff), Lose: Phase 2
 4. Fuck Check 1 - Win: Phase 5 (+debuff), Lose: Phase 3
 5. Fuck Check 2 - Win: Phase 6 (+debuff), Lose: Phase 4
 6. Climax - Win: VICTORY, Lose: Phase 5
@@ -1160,20 +1299,23 @@ ${defender.displayName}, use [b]!defendstun[/b] to defend!`);
 
 [b]Stuns:[/b]
 High-risk move. Success skips a phase and gives -2 debuff.
-Failure: If clothed go to Phase 2, if naked go to Phase 3.`);
+Failure: If clothed, stripped + Phase 3. If naked, Phase 4.
+If already at Phase 3+, skip one phase forward.`);
     }
 };
 
 /**
  * Apply stun success
+ * Successful stun: skip one phase ahead AND apply -2 debuff to defender.
+ * If Phase 2 is being passed through, strip the defender (if clothed) or just pin (if naked).
  */
 async function applyStunSuccess(gs, attacker, defender) {
     let msg = '';
-    
+
     // Stun skips a phase - advance TWO phases from current
     const currentPhase = gs.phase;
     let firstAdvance = PHASES[currentPhase].winAdvance;
-    
+
     if (firstAdvance === null) {
         // Already at climax - win!
         gs.finished = true;
@@ -1185,61 +1327,83 @@ async function applyStunSuccess(gs, attacker, defender) {
     } else {
         // Get the phase after the first advance (skip one phase)
         let targetPhase = PHASES[firstAdvance].winAdvance;
-        
-        // If first advance is Phase 2, strip the defender
-        if (firstAdvance === 2 && defender.clothed) {
-            defender.clothed = false;
-            msg += `[color=yellow]${defender.displayName} has been stripped![/color]\n`;
+
+        // If first advance passes through Phase 2, handle strip/pin
+        if (firstAdvance === 2) {
+            if (defender.clothed) {
+                defender.clothed = false;
+                msg += `[color=yellow]${defender.displayName} has been stripped![/color]\n`;
+            } else {
+                msg += `[color=yellow]${defender.displayName} is already naked - pinned down![/color]\n`;
+            }
         }
-        
-        // If target is null, we land on the climax phase
+
+        // Apply debuffs from the skipped-through phase if applicable
+        if (PHASES[firstAdvance].winDefenderDebuff) {
+            defender.battleDebuff = (defender.battleDebuff || 0) + PHASES[firstAdvance].winDefenderDebuff;
+            msg += `[color=red]${defender.displayName} gains ${PHASES[firstAdvance].winDefenderDebuff} from skipped phase![/color]\n`;
+        }
+
+        // If target is null, we've passed the climax = victory
         if (targetPhase === null) {
             gs.finished = true;
             gs.winner = attacker;
             gs.loser = defender;
             await recordMatchResult(attacker.displayName, defender.displayName);
-            msg += `${defender.displayName} is stunned at the Climax phase!\n`;
+            msg += `${defender.displayName} is stunned past the Climax phase!\n`;
             msg += `[b]🏆 ${attacker.displayName} WINS! 🏆[/b]`;
             return msg;
         }
-        
-        // Skip Phase 2 in target if defender is already naked
-        if (targetPhase === 2 && !defender.clothed) {
-            targetPhase = 3;
-            msg += `[color=cyan]${defender.displayName} is already naked - skipping Strip phase![/color]\n`;
-        }
-        
+
+        // Phase 2 is NOT skipped as a target - it converts to Pin if defender is naked
+
         gs.phase = targetPhase;
         defender.battleDebuff = (defender.battleDebuff || 0) - 2;
         msg += `${defender.displayName} is stunned! Skipping to Phase ${targetPhase}: ${PHASES[targetPhase].name}\n`;
         msg += `[color=red]${defender.displayName} gains -2 to all rolls![/color]`;
     }
-    
+
     return msg;
 }
 
 /**
  * Apply stun failure
+ * Rules:
+ * - If clothed: stripped (clothed=false) AND sent to Phase 3 (penetration) on defense
+ * - If naked: sent to Phase 4 (fuck check 1) on defense
+ * - If already in a vulnerable stage (phase 3+): skip one phase forward
+ * - Always swap attacker (no debuff applied)
  */
 function applyStunFailure(gs, attacker, defender) {
     let msg = '';
-    
-    // Attacker becomes vulnerable
-    // If clothed: Go to Phase 2 (strip/fully pin)
-    // If naked: Go to Phase 3 (penetration)
-    // Swap attacker
-    
+
     if (attacker.clothed) {
-        gs.phase = 2;
-        msg += `${attacker.displayName} is left vulnerable and will be stripped!\n`;
-    } else {
+        // Clothed: get stripped AND go to Phase 3
+        attacker.clothed = false;
         gs.phase = 3;
-        msg += `${attacker.displayName} is left vulnerable and will be penetrated!\n`;
+        msg += `${attacker.displayName}'s stun fails! They are stripped and left vulnerable to penetration!\n`;
+        msg += `[color=yellow]${attacker.displayName} has been stripped![/color]\n`;
+    } else if (gs.phase >= 3) {
+        // Already in a vulnerable stage (phase 3+): skip one phase forward
+        let targetPhase = gs.phase + 1;
+        if (targetPhase > 6) targetPhase = 6;
+        if (targetPhase === 6) {
+            // Landing on climax
+            gs.phase = 6;
+            msg += `${attacker.displayName}'s stun fails catastrophically! Pushed to the Climax phase!\n`;
+        } else {
+            gs.phase = targetPhase;
+            msg += `${attacker.displayName}'s stun fails! Pushed forward to Phase ${gs.phase}: ${PHASES[gs.phase].name}!\n`;
+        }
+    } else {
+        // Naked but not yet at phase 3+: go to Phase 4
+        gs.phase = 4;
+        msg += `${attacker.displayName}'s stun fails! Already naked - pushed to Fuck Check!\n`;
     }
-    
+
     // Swap attacker
     gs.currentAttacker = gs.currentAttacker === 1 ? 2 : 1;
     msg += `[b]${defender.displayName} is now the attacker![/b]`;
-    
+
     return msg;
 }

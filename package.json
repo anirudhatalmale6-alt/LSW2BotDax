@@ -1,0 +1,24 @@
+{
+  "name": "flist-bot",
+  "version": "1.0.0",
+  "description": "A simple bot-handling library for F-list chat with plugin support",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "keywords": [
+    "flist",
+    "bot",
+    "chat",
+    "websocket"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.3.1",
+    "mongodb": "^7.0.0",
+    "ws": "^8.14.2"
+  }
+}

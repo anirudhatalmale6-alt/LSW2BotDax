@@ -1,0 +1,9 @@
+{
+  "pluginsDirectory": "./plugins",
+  "rooms": [
+    {
+      "channel": "adh-38a0e2eb3080d93df777",
+      "plugins": ["club"]
+    }
+  ]
+}

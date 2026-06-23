@@ -1401,6 +1401,10 @@ function applyStunFailure(gs, attacker, defender) {
         msg += `${attacker.displayName}'s stun fails! Already naked - pushed to Fuck Check!\n`;
     }
 
+    // Failed stun applies -2 debuff to the attacker
+    attacker.battleDebuff = (attacker.battleDebuff || 0) - 2;
+    msg += `[color=red]${attacker.displayName} gains -2 to all rolls from the failed stun![/color]\n`;
+
     // Swap attacker
     gs.currentAttacker = gs.currentAttacker === 1 ? 2 : 1;
     msg += `[b]${defender.displayName} is now the attacker![/b]`;

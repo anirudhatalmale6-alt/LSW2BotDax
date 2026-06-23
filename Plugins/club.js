@@ -484,14 +484,16 @@ export function onAttach({ client, channel, title, context }) {
                 client.send('CIU', { channel, character: pendingData.player1Name });
                 client.send('CIU', { channel, character: pendingData.player2Name });
 
-                // Announce the fight in the private room
+                // Delay the announcement so players have time to join the room
                 const p1 = pendingData.player1Name;
                 const p2 = pendingData.player2Name;
-                client.sendChannelMessage(channel, `[b]⚔️ PRIVATE FIGHT ROOM ⚔️[/b]
+                setTimeout(() => {
+                    client.sendChannelMessage(channel, `[b]⚔️ PRIVATE FIGHT ROOM ⚔️[/b]
 [icon]${p1}[/icon] vs [icon]${p2}[/icon]
 
 [b]INITIATIVE ROLL[/b]
 Both fighters, use [b]!roll[/b] to determine who attacks first!`);
+                }, 3000);
                 break;
             }
         }
@@ -706,14 +708,64 @@ Valid types: fat, chubby, thicc, curvy, average, toned, buff`);
             
             context.challengeState = {
                 challenger: challenger,
-                target: target
+                target: target,
+                isPrivate: false
             };
-            
+
             reply(`[b]⚔️ CHALLENGE! ⚔️[/b]
 [icon]${challenger.displayName}[/icon] has challenged [icon]${target.displayName}[/icon] to a dice combat fight!
 ${target.displayName}, use [b]!accept[/b] to accept or [b]!decline[/b] to decline.`);
         } catch (error) {
             console.error(`[${name}] Challenge error:`, error);
+            reply('An error occurred. Please try again later.');
+        }
+    },
+
+    /**
+     * !challengeprivate <player> - Challenge to a private room fight
+     */
+    challengeprivate: async ({ character, args, context, reply }) => {
+        try {
+            if (context.gameState) {
+                reply('A fight is already in progress! Use !endfight to reset.');
+                return;
+            }
+
+            if (args.length === 0) {
+                reply('Usage: !challengeprivate <player>');
+                return;
+            }
+
+            const challenger = await getPlayer(character);
+            if (!challenger) {
+                reply(`${character}, you need to !clubregister first!`);
+                return;
+            }
+
+            const targetName = args.join(' ');
+            const target = await getPlayer(targetName);
+
+            if (!target) {
+                reply(`${targetName} is not registered!`);
+                return;
+            }
+
+            if (target.username === challenger.username) {
+                reply("You can't challenge yourself!");
+                return;
+            }
+
+            context.challengeState = {
+                challenger: challenger,
+                target: target,
+                isPrivate: true
+            };
+
+            reply(`[b]⚔️ PRIVATE CHALLENGE! ⚔️[/b]
+[icon]${challenger.displayName}[/icon] has challenged [icon]${target.displayName}[/icon] to a private dice combat fight!
+${target.displayName}, use [b]!accept[/b] to accept or [b]!decline[/b] to decline.`);
+        } catch (error) {
+            console.error(`[${name}] ChallengePrivate error:`, error);
             reply('An error occurred. Please try again later.');
         }
     },
@@ -733,9 +785,9 @@ ${target.displayName}, use [b]!accept[/b] to accept or [b]!decline[/b] to declin
                 return;
             }
 
-            // Start initiative phase
             const p1 = context.challengeState.challenger;
             const p2 = context.challengeState.target;
+            const isPrivate = context.challengeState.isPrivate || false;
 
             const gameState = {
                 player1: {
@@ -756,32 +808,39 @@ ${target.displayName}, use [b]!accept[/b] to accept or [b]!decline[/b] to declin
                     battleDebuff: 0,
                     clothed: true
                 },
-                phase: 0, // Initiative phase
+                phase: 0,
                 currentAttacker: null,
                 initiativeState: 'rolling'
             };
 
             context.challengeState = null;
 
-            // Create a private room for the fight
-            const roomName = `Fight: ${p1.displayName} vs ${p2.displayName}`;
+            if (isPrivate) {
+                const roomName = `Fight: ${p1.displayName} vs ${p2.displayName}`;
 
-            // Store pending game data keyed by room name for pickup in onAttach
-            pendingPrivateGames.set(roomName.toLowerCase(), {
-                gameState,
-                player1Name: p1.displayName,
-                player2Name: p2.displayName
-            });
+                pendingPrivateGames.set(roomName.toLowerCase(), {
+                    gameState,
+                    player1Name: p1.displayName,
+                    player2Name: p2.displayName
+                });
 
-            // Create the private room (bot auto-joins on creation)
-            // Invites are sent in onAttach once we have the actual channel ID
-            client.send('CCR', { channel: roomName });
+                client.send('CCR', { channel: roomName });
 
-            reply(`[b]⚔️ FIGHT ACCEPTED! ⚔️[/b]
+                reply(`[b]⚔️ PRIVATE FIGHT ACCEPTED! ⚔️[/b]
 [icon]${p1.displayName}[/icon] vs [icon]${p2.displayName}[/icon]
 
 A private room "[b]${roomName}[/b]" is being created. Both fighters will be invited.
 Head to the private room to begin the fight!`);
+            } else {
+                context.gameState = gameState;
+                context.pendingRolls = {};
+
+                reply(`[b]⚔️ FIGHT ACCEPTED! ⚔️[/b]
+[icon]${p1.displayName}[/icon] vs [icon]${p2.displayName}[/icon]
+
+[b]INITIATIVE ROLL[/b]
+Both fighters, use [b]!roll[/b] to determine who attacks first!`);
+            }
         } catch (error) {
             console.error(`[${name}] Accept error:`, error);
             reply('An error occurred. Please try again later.');
@@ -1219,8 +1278,9 @@ ${defender.displayName}, use [b]!defendstun[/b] to defend!`);
 [b]!clubstats [player][/b] - View combat record
 
 [b]Fighting:[/b]
-[b]!challenge <player>[/b] - Challenge someone
-[b]!accept / !decline[/b] - Respond to challenge (creates a private room)
+[b]!challenge <player>[/b] - Challenge someone (fight in current room)
+[b]!challengeprivate <player>[/b] - Challenge someone (fight in a private room)
+[b]!accept / !decline[/b] - Respond to a challenge
 [b]!roll[/b] - Roll d20 (initiative or combat)
 [b]!stun[/b] - Attempt high-risk stun move
 [b]!status[/b] - View current fight status
@@ -1233,7 +1293,7 @@ ${defender.displayName}, use [b]!defendstun[/b] to defend!`);
 • Highest roll wins (ties go to defender)
 • Roll 1 = auto-lose + skip an extra phase
 • Roll 20+ total = crit (impossible if debuffs make 20 unreachable)
-• Accepted challenges create a private fight room
+• Failed stuns apply -2 debuff to the attacker
 • Size & streak modifiers apply automatically`);
     },
 
